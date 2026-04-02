@@ -12,7 +12,7 @@ from deep_translator import GoogleTranslator
 
 
 # =========================
-# 基础配置
+# 体育 RSS 源
 # =========================
 
 RSS_URLS = [
@@ -24,11 +24,13 @@ RSS_URLS = [
 ]
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")  # 例如 @你的体育频道用户名
+CHAT_ID = os.getenv("CHAT_ID")
+
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
 SEND_DELAY = float(os.getenv("SEND_DELAY", "2"))
 MAX_SUMMARY_LENGTH = int(os.getenv("MAX_SUMMARY_LENGTH", "900"))
-FIRST_RUN_SKIP_OLD = os.getenv("FIRST_RUN_SKIP_OLD", "true").lower() == "true"
+
+FIRST_RUN_SKIP_OLD = True
 
 
 # =========================
@@ -104,10 +106,8 @@ def shorten_text(text: str, max_len: int) -> str:
 
 def safe_translate(text: str) -> str:
     """
-    规则：
-    - 翻译成功返回中文
-    - 翻译失败返回空字符串
-    - 不返回英文原文
+    翻译成功返回中文
+    翻译失败返回空字符串
     """
     if not text:
         return ""
@@ -136,7 +136,7 @@ def detect_tags(title_en: str, title_cn: str, summary_cn: str) -> list:
     tags = []
 
     keyword_map = {
-        "#足球": ["football", "soccer", "premier league", "champions league", "fifa", "uefa", "曼联", "皇马", "巴萨"],
+        "#足球": ["football", "soccer", "premier league", "champions league", "fifa", "uefa", "man utd", "arsenal", "barcelona", "real madrid"],
         "#篮球": ["nba", "basketball", "lakers", "warriors", "celtics", "lebron", "curry"],
         "#网球": ["tennis", "atp", "wta", "grand slam", "djokovic", "nadal", "federer"],
         "#F1": ["formula 1", "f1", "verstappen", "hamilton", "ferrari", "red bull"],
@@ -198,7 +198,7 @@ def is_valid_http_url(url: str) -> bool:
 
 def build_caption(title_cn: str, summary_cn: str, tags: list) -> str:
     """
-    只发中文，不带链接，不带英文原文，不显示来源
+    只发中文，不带链接，不带来源，不带英文原文
     """
     header = "【体育快讯】"
     tag_line = " ".join(tags).strip()
@@ -252,9 +252,6 @@ def send_telegram_photo(photo_url: str, caption: str):
 
 
 def extract_summary(entry) -> str:
-    """
-    尽量提取更长的正文摘要
-    """
     raw_summary = (
         getattr(entry, "summary", "")
         or getattr(entry, "description", "")
@@ -277,7 +274,7 @@ def extract_summary(entry) -> str:
 
 
 # =========================
-# 核心处理
+# 核心逻辑
 # =========================
 
 def process_feed(feed_url: str):
@@ -356,7 +353,7 @@ def main():
 
     init_db()
 
-    print("体育机器人启动成功（长摘要图文无链接无来源版）")
+    print("体育机器人启动成功（简化版）")
     print("频道:", CHAT_ID)
 
     while True:

@@ -1,252 +1,373 @@
 import os
 import re
-import json
 import time
 import html
-import hashlib
-import logging
-from typing import Dict, List, Optional
+import sqlite3
+from datetime import datetime
+from urllib.parse import urlparse
 
 import feedparser
 import requests
 from deep_translator import GoogleTranslator
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
+# =========================
+# 基础配置
+# =========================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("CHAT_ID", "").strip()
-FEEDS = [x.strip() for x in os.getenv("FEEDS", "").split(",") if x.strip()]
+RSS_URLS = [
+    "https://www.espn.com/espn/rss/news",
+    "http://feeds.bbci.co.uk/sport/rss.xml?edition=uk",
+    "https://www.skysports.com/rss/12040",
+    "https://sports.yahoo.com/rss/",
+    "https://www.cbssports.com/rss/headlines/",
+]
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")  # 例如 @你的体育频道用户名
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
-SEND_DELAY = float(os.getenv("SEND_DELAY", "1.5"))
+SEND_DELAY = float(os.getenv("SEND_DELAY", "2"))
+MAX_SUMMARY_LENGTH = int(os.getenv("MAX_SUMMARY_LENGTH", "900"))
 FIRST_RUN_SKIP_OLD = os.getenv("FIRST_RUN_SKIP_OLD", "true").lower() == "true"
-TRANSLATE = os.getenv("TRANSLATE", "true").lower() == "true"
-TRANSLATE_SUMMARY = os.getenv("TRANSLATE_SUMMARY", "false").lower() == "true"
-TARGET_LANG = os.getenv("TARGET_LANG", "zh-CN").strip()
-STATE_FILE = os.getenv("STATE_FILE", "state.json").strip()
-MAX_SUMMARY_LENGTH = int(os.getenv("MAX_SUMMARY_LENGTH", "180"))
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
-
-if not BOT_TOKEN:
-    raise ValueError("缺少环境变量 BOT_TOKEN")
-if not CHAT_ID:
-    raise ValueError("缺少环境变量 CHAT_ID")
-if not FEEDS:
-    raise ValueError("缺少环境变量 FEEDS，格式示例：https://a.com/rss,https://b.com/feed")
-
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
 
-def load_state() -> Dict:
-    if not os.path.exists(STATE_FILE):
-        return {"sent": [], "initialized": False}
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"sent": [], "initialized": False}
+# =========================
+# 数据库
+# =========================
+
+def init_db():
+    conn = sqlite3.connect("data.db")
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS sent_items (
+            link TEXT PRIMARY KEY,
+            created_at TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
 
 
-def save_state(state: Dict) -> None:
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+def has_sent(link: str) -> bool:
+    conn = sqlite3.connect("data.db")
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM sent_items WHERE link = ?", (link,))
+    row = cur.fetchone()
+    conn.close()
+    return row is not None
 
 
-def clean_html_text(text: str) -> str:
+def mark_sent(link: str):
+    conn = sqlite3.connect("data.db")
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO sent_items(link, created_at) VALUES (?, ?)",
+        (link, datetime.now().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+
+def has_any_sent_items() -> bool:
+    conn = sqlite3.connect("data.db")
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM sent_items")
+    count = cur.fetchone()[0]
+    conn.close()
+    return count > 0
+
+
+# =========================
+# 工具函数
+# =========================
+
+def clean_html(text: str) -> str:
     if not text:
         return ""
     text = html.unescape(text)
-    text = re.sub(r"<[^>]+>", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
+    text = re.sub(r"</p\s*>", "\n", text, flags=re.I)
+    text = re.sub(r"<.*?>", "", text, flags=re.S)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    return text.strip()
 
 
-def truncate_text(text: str, max_len: int) -> str:
+def shorten_text(text: str, max_len: int) -> str:
+    if not text:
+        return ""
+    text = text.strip()
     if len(text) <= max_len:
         return text
     return text[:max_len].rstrip() + "..."
 
 
-def has_chinese(text: str) -> bool:
-    return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
-
-
-def translate_text(text: str) -> str:
-    text = (text or "").strip()
+def safe_translate(text: str) -> str:
+    """
+    规则：
+    - 翻译成功返回中文
+    - 翻译失败返回空字符串
+    - 不返回英文原文
+    """
     if not text:
         return ""
-    if has_chinese(text):
-        return text
-    try:
-        return GoogleTranslator(source="auto", target=TARGET_LANG).translate(text)
-    except Exception as e:
-        logging.warning(f"翻译失败: {e}")
-        return text
+
+    text = text.strip()
+    if not text:
+        return ""
+
+    if len(text) > 1200:
+        text = text[:1200]
+
+    for i in range(3):
+        try:
+            result = GoogleTranslator(source="auto", target="zh-CN").translate(text)
+            if result and result.strip():
+                return result.strip()
+        except Exception as e:
+            print(f"翻译失败，第{i + 1}次: {e}")
+            time.sleep(1)
+
+    return ""
 
 
-def make_entry_id(entry) -> str:
-    raw = (
-        entry.get("id")
-        or entry.get("link")
-        or f"{entry.get('title', '')}-{entry.get('published', '')}"
-    )
-    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+def detect_tags(title_en: str, title_cn: str, summary_cn: str) -> list:
+    text = f"{title_en}\n{title_cn}\n{summary_cn}".lower()
+    tags = []
 
-
-def send_telegram_message(text: str) -> bool:
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text,
-        "disable_web_page_preview": False,
+    keyword_map = {
+        "#足球": ["football", "soccer", "premier league", "champions league", "fifa", "uefa", "曼联", "皇马", "巴萨"],
+        "#篮球": ["nba", "basketball", "lakers", "warriors", "celtics", "lebron", "curry"],
+        "#网球": ["tennis", "atp", "wta", "grand slam", "djokovic", "nadal", "federer"],
+        "#F1": ["formula 1", "f1", "verstappen", "hamilton", "ferrari", "red bull"],
+        "#NFL": ["nfl", "super bowl", "chiefs", "eagles", "cowboys"],
+        "#棒球": ["mlb", "baseball", "yankees", "dodgers"],
+        "#高尔夫": ["golf", "pga", "masters", "rory mcilroy", "tiger woods"],
+        "#综合": ["olympics", "sports", "athlete", "match", "tournament", "coach"],
     }
+
+    for tag, keywords in keyword_map.items():
+        if any(k in text for k in keywords):
+            tags.append(tag)
+
+    return tags[:3]
+
+
+def get_image_url(entry) -> str:
+    media_content = getattr(entry, "media_content", None)
+    if media_content and isinstance(media_content, list):
+        for item in media_content:
+            url = item.get("url")
+            if url:
+                return url
+
+    media_thumbnail = getattr(entry, "media_thumbnail", None)
+    if media_thumbnail and isinstance(media_thumbnail, list):
+        for item in media_thumbnail:
+            url = item.get("url")
+            if url:
+                return url
+
+    links = getattr(entry, "links", [])
+    if links:
+        for item in links:
+            href = item.get("href", "")
+            type_ = item.get("type", "")
+            rel = item.get("rel", "")
+            if href and (rel == "enclosure" or str(type_).startswith("image/")):
+                return href
+
+    raw_summary = getattr(entry, "summary", "") or getattr(entry, "description", "")
+    if raw_summary:
+        m = re.search(r'<img[^>]+src="([^"]+)"', raw_summary, re.I)
+        if m:
+            return m.group(1)
+
+    return ""
+
+
+def is_valid_http_url(url: str) -> bool:
+    if not url:
+        return False
     try:
-        resp = requests.post(TELEGRAM_API, data=payload, timeout=REQUEST_TIMEOUT)
-        logging.info(f"发送结果: {resp.status_code} {resp.text[:300]}")
-        return resp.ok
-    except Exception as e:
-        logging.error(f"发送失败: {e}")
+        p = urlparse(url)
+        return p.scheme in ("http", "https") and bool(p.netloc)
+    except Exception:
         return False
 
 
-def parse_feed(feed_url: str):
-    try:
-        parsed = feedparser.parse(feed_url)
-        if parsed.bozo:
-            logging.warning(f"RSS 解析警告: {feed_url}")
-        return parsed
-    except Exception as e:
-        logging.error(f"RSS 读取失败 {feed_url}: {e}")
-        return None
+def build_caption(title_cn: str, summary_cn: str, tags: list) -> str:
+    """
+    只发中文，不带链接，不带英文原文，不显示来源
+    """
+    header = "【体育快讯】"
+    tag_line = " ".join(tags).strip()
 
-
-def format_message(
-    source_title: str,
-    title: str,
-    translated_title: str,
-    summary: str,
-    translated_summary: str,
-    link: str,
-) -> str:
-    parts: List[str] = []
-
-    if TRANSLATE and translated_title and translated_title != title:
-        parts.append("【体育翻译】")
-        parts.append("")
-        parts.append(translated_title)
-        parts.append("")
-        parts.append(f"原文：{title}")
-    else:
-        parts.append(title)
-
-    if summary:
-        parts.append("")
-        if TRANSLATE_SUMMARY and translated_summary and translated_summary != summary:
-            parts.append(f"摘要：{translated_summary}")
-            parts.append(f"原摘要：{summary}")
-        else:
-            parts.append(summary)
+    parts = [header]
+    if tag_line:
+        parts.append(tag_line)
 
     parts.append("")
-    parts.append(f"来源：{source_title}")
-    parts.append(link)
+    parts.append(title_cn.strip())
 
-    return "\n".join(parts).strip()
+    if summary_cn.strip():
+        parts.append("")
+        parts.append(summary_cn.strip())
+
+    caption = "\n".join(parts).strip()
+
+    if len(caption) > 1000:
+        caption = caption[:1000].rstrip() + "..."
+    return caption
+
+
+def send_telegram_message(text: str):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    resp = requests.post(
+        url,
+        data={
+            "chat_id": CHAT_ID,
+            "text": text,
+            "disable_web_page_preview": True
+        },
+        timeout=30
+    )
+    print("sendMessage 结果:", resp.status_code, resp.text)
+    return resp
+
+
+def send_telegram_photo(photo_url: str, caption: str):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    resp = requests.post(
+        url,
+        data={
+            "chat_id": CHAT_ID,
+            "photo": photo_url,
+            "caption": caption
+        },
+        timeout=30
+    )
+    print("sendPhoto 结果:", resp.status_code, resp.text)
+    return resp
+
+
+def extract_summary(entry) -> str:
+    """
+    尽量提取更长的正文摘要
+    """
+    raw_summary = (
+        getattr(entry, "summary", "")
+        or getattr(entry, "description", "")
+    )
+
+    content_list = getattr(entry, "content", None)
+    if content_list and isinstance(content_list, list):
+        for item in content_list:
+            value = item.get("value", "")
+            if value and len(value) > len(raw_summary):
+                raw_summary = value
+
+    summary_clean = clean_html(raw_summary)
+    summary_clean = re.sub(r"\s+", " ", summary_clean).strip()
+
+    if len(summary_clean) < 40:
+        return ""
+
+    return shorten_text(summary_clean, MAX_SUMMARY_LENGTH)
+
+
+# =========================
+# 核心处理
+# =========================
+
+def process_feed(feed_url: str):
+    print(f"[{datetime.now()}] 检查 RSS: {feed_url}")
+    feed = feedparser.parse(feed_url)
+
+    if not feed.entries:
+        print("没有抓到内容")
+        return
+
+    entries = list(feed.entries[:10])
+    entries.reverse()
+
+    first_run = not has_any_sent_items()
+
+    for entry in entries:
+        link = getattr(entry, "link", "").strip()
+        title_en = clean_html(getattr(entry, "title", "").strip())
+
+        if not link or not title_en:
+            continue
+
+        if has_sent(link):
+            continue
+
+        if first_run and FIRST_RUN_SKIP_OLD:
+            print("首次运行，跳过旧新闻:", title_en)
+            mark_sent(link)
+            continue
+
+        summary_clean = extract_summary(entry)
+
+        title_cn = safe_translate(title_en)
+        summary_cn = safe_translate(summary_clean) if summary_clean else ""
+
+        if not title_cn:
+            print("跳过：标题翻译失败 ->", title_en)
+            mark_sent(link)
+            continue
+
+        if summary_clean and not summary_cn:
+            print("摘要翻译失败，仅发送标题 ->", title_en)
+            summary_cn = ""
+
+        if summary_cn and len(summary_cn.strip()) < 15:
+            summary_cn = ""
+
+        tags = detect_tags(title_en, title_cn, summary_cn)
+        caption = build_caption(title_cn, summary_cn, tags)
+
+        image_url = get_image_url(entry)
+
+        try:
+            if is_valid_http_url(image_url):
+                resp = send_telegram_photo(image_url, caption)
+                if resp.status_code != 200:
+                    print("图片发送失败，改为纯文字")
+                    send_telegram_message(caption)
+            else:
+                send_telegram_message(caption)
+
+            mark_sent(link)
+            print("已发送:", title_en)
+
+        except Exception as e:
+            print("发送失败:", e)
+
+        time.sleep(SEND_DELAY)
 
 
 def main():
-    state = load_state()
-    sent_ids = set(state.get("sent", []))
-    initialized = state.get("initialized", False)
+    if not BOT_TOKEN:
+        raise ValueError("缺少环境变量 BOT_TOKEN")
+    if not CHAT_ID:
+        raise ValueError("缺少环境变量 CHAT_ID")
 
-    logging.info("程序启动成功")
-    logging.info(f"订阅数: {len(FEEDS)}")
-    logging.info(f"检查间隔: {CHECK_INTERVAL}s")
-    logging.info(f"首跑跳过旧新闻: {FIRST_RUN_SKIP_OLD}")
-    logging.info(f"翻译开启: {TRANSLATE}")
-    logging.info(f"翻译摘要: {TRANSLATE_SUMMARY}")
+    init_db()
+
+    print("体育机器人启动成功（长摘要图文无链接无来源版）")
+    print("频道:", CHAT_ID)
 
     while True:
-        try:
-            new_sent = 0
+        for rss in RSS_URLS:
+            try:
+                process_feed(rss)
+            except Exception as e:
+                print(f"处理 RSS 失败 {rss}: {e}")
 
-            for feed_url in FEEDS:
-                logging.info(f"检查 RSS: {feed_url}")
-                parsed = parse_feed(feed_url)
-                if not parsed:
-                    continue
-
-                source_title = parsed.feed.get("title", feed_url)
-
-                entries = parsed.entries or []
-                if not entries:
-                    continue
-
-                # 老到新排序，避免频道顺序颠倒
-                entries = list(entries)[::-1]
-
-                for entry in entries:
-                    eid = make_entry_id(entry)
-
-                    if eid in sent_ids:
-                        continue
-
-                    if FIRST_RUN_SKIP_OLD and not initialized:
-                        sent_ids.add(eid)
-                        continue
-
-                    title = clean_html_text(entry.get("title", "")).strip()
-                    link = entry.get("link", "").strip()
-
-                    summary = clean_html_text(
-                        entry.get("summary", "") or entry.get("description", "")
-                    )
-                    summary = truncate_text(summary, MAX_SUMMARY_LENGTH)
-
-                    translated_title = translate_text(title) if TRANSLATE else title
-                    translated_summary = (
-                        translate_text(summary)
-                        if TRANSLATE and TRANSLATE_SUMMARY and summary
-                        else summary
-                    )
-
-                    msg = format_message(
-                        source_title=source_title,
-                        title=title,
-                        translated_title=translated_title,
-                        summary=summary,
-                        translated_summary=translated_summary,
-                        link=link,
-                    )
-
-                    ok = send_telegram_message(msg)
-                    if ok:
-                        sent_ids.add(eid)
-                        new_sent += 1
-                        time.sleep(SEND_DELAY)
-
-            if not initialized:
-                initialized = True
-
-            # 控制 state 大小
-            sent_list = list(sent_ids)
-            if len(sent_list) > 5000:
-                sent_list = sent_list[-5000:]
-                sent_ids = set(sent_list)
-
-            save_state({
-                "sent": sent_list,
-                "initialized": initialized
-            })
-
-            logging.info(f"本轮完成，新增推送: {new_sent}")
-            time.sleep(CHECK_INTERVAL)
-
-        except Exception as e:
-            logging.exception(f"主循环异常: {e}")
-            time.sleep(10)
+        print(f"休眠 {CHECK_INTERVAL} 秒...\n")
+        time.sleep(CHECK_INTERVAL)
 
 
 if __name__ == "__main__":

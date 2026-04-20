@@ -3,6 +3,8 @@ import re
 import time
 import html
 import sqlite3
+import random
+import tempfile
 from datetime import datetime
 from urllib.parse import urlparse, urljoin
 
@@ -12,29 +14,48 @@ from deep_translator import GoogleTranslator
 
 
 # =========================
-# 体育 RSS 源
+# 体育 RSS 源（精简版）
 # =========================
 
 RSS_URLS = [
     "https://www.espn.com/espn/rss/news",
     "http://feeds.bbci.co.uk/sport/rss.xml?edition=uk",
     "https://www.skysports.com/rss/12040",
-    "https://sports.yahoo.com/rss/",
-    "https://www.cbssports.com/rss/headlines/",
 ]
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "900"))   # 默认 15 分钟
 SEND_DELAY = float(os.getenv("SEND_DELAY", "2"))
-MAX_SUMMARY_LENGTH = int(os.getenv("MAX_SUMMARY_LENGTH", "900"))
+MAX_SUMMARY_LENGTH = int(os.getenv("MAX_SUMMARY_LENGTH", "600"))
 
 FIRST_RUN_SKIP_OLD = True
+MAX_FEED_ITEMS_PER_CHECK = 3
+COVERS_DIR = "covers"
 
 REQUEST_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+    "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+    "Referer": "https://www.google.com/",
 }
+
+SKIP_KEYWORDS = [
+    "live",
+    "watch",
+    "video",
+    "highlights",
+    "podcast",
+    "newsletter",
+    "ranking",
+    "power rankings",
+    "fantasy",
+    "rumour",
+    "rumor",
+    "minute-by-minute",
+    "as it happened",
+    "preview show",
+]
 
 
 # =========================
@@ -84,7 +105,7 @@ def has_any_sent_items() -> bool:
 
 
 # =========================
-# 工具函数
+# 文本处理
 # =========================
 
 def clean_html(text: str) -> str:
@@ -109,6 +130,10 @@ def shorten_text(text: str, max_len: int) -> str:
 
 
 def safe_translate(text: str) -> str:
+    """
+    翻译成功返回中文
+    翻译失败返回空字符串
+    """
     if not text:
         return ""
 
@@ -129,6 +154,39 @@ def safe_translate(text: str) -> str:
             time.sleep(1)
 
     return ""
+
+
+def extract_summary(entry) -> str:
+    raw_summary = (
+        getattr(entry, "summary", "")
+        or getattr(entry, "description", "")
+    )
+
+    content_list = getattr(entry, "content", None)
+    if content_list and isinstance(content_list, list):
+        for item in content_list:
+            value = item.get("value", "")
+            if value and len(value) > len(raw_summary):
+                raw_summary = value
+
+    summary_clean = clean_html(raw_summary)
+    summary_clean = re.sub(r"\s+", " ", summary_clean).strip()
+
+    if len(summary_clean) < 40:
+        return ""
+
+    return shorten_text(summary_clean, MAX_SUMMARY_LENGTH)
+
+
+def should_skip_title(title_en: str) -> bool:
+    title_lower = title_en.lower().strip()
+    if not title_lower:
+        return True
+
+    if any(k in title_lower for k in SKIP_KEYWORDS):
+        return True
+
+    return False
 
 
 def detect_tags(title_en: str, title_cn: str, summary_cn: str) -> list:
@@ -153,6 +211,36 @@ def detect_tags(title_en: str, title_cn: str, summary_cn: str) -> list:
     return tags[:3]
 
 
+def build_caption(title_cn: str, summary_cn: str, tags: list) -> str:
+    """
+    只发中文，不带链接，不带来源，不带英文原文
+    """
+    header = "【体育快讯】"
+    tag_line = " ".join(tags).strip()
+
+    parts = [header]
+    if tag_line:
+        parts.append(tag_line)
+
+    parts.append("")
+    parts.append(title_cn.strip())
+
+    if summary_cn.strip():
+        parts.append("")
+        parts.append(summary_cn.strip())
+
+    caption = "\n".join(parts).strip()
+
+    # Telegram caption 最长 1024，留点余量
+    if len(caption) > 1000:
+        caption = caption[:1000].rstrip() + "..."
+    return caption
+
+
+# =========================
+# 图片处理
+# =========================
+
 def is_valid_http_url(url: str) -> bool:
     if not url:
         return False
@@ -161,6 +249,16 @@ def is_valid_http_url(url: str) -> bool:
         return p.scheme in ("http", "https") and bool(p.netloc)
     except Exception:
         return False
+
+
+def normalize_image_url(img_url: str, base_url: str) -> str:
+    if not img_url:
+        return ""
+    if img_url.startswith("//"):
+        return "https:" + img_url
+    if img_url.startswith("/"):
+        return urljoin(base_url, img_url)
+    return img_url
 
 
 def get_image_url_from_rss(entry) -> str:
@@ -196,24 +294,7 @@ def get_image_url_from_rss(entry) -> str:
     return ""
 
 
-def normalize_image_url(img_url: str, base_url: str) -> str:
-    if not img_url:
-        return ""
-    if img_url.startswith("//"):
-        return "https:" + img_url
-    if img_url.startswith("/"):
-        return urljoin(base_url, img_url)
-    return img_url
-
-
 def get_image_url_from_page(article_url: str) -> str:
-    """
-    RSS 没图时，进原文页面抓图。
-    优先：
-    1. og:image
-    2. twitter:image
-    3. 页面里第一张较大的图片
-    """
     if not is_valid_http_url(article_url):
         return ""
 
@@ -224,7 +305,6 @@ def get_image_url_from_page(article_url: str) -> str:
 
         html_text = resp.text
 
-        # og:image
         patterns = [
             r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
             r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
@@ -239,7 +319,6 @@ def get_image_url_from_page(article_url: str) -> str:
                 if is_valid_http_url(img):
                     return img
 
-        # 退而求其次：找 img 标签
         imgs = re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', html_text, re.I)
         for img in imgs:
             img = normalize_image_url(img.strip(), article_url)
@@ -247,7 +326,6 @@ def get_image_url_from_page(article_url: str) -> str:
                 continue
 
             lower_img = img.lower()
-            # 尽量过滤 logo / icon / avatar
             if any(x in lower_img for x in ["logo", "icon", "avatar", "sprite", ".svg"]):
                 continue
 
@@ -259,13 +337,31 @@ def get_image_url_from_page(article_url: str) -> str:
     return ""
 
 
-def get_best_image_url(entry, article_url: str) -> str:
-    # 先用 RSS 里的图
+def get_local_cover_list():
+    if not os.path.isdir(COVERS_DIR):
+        return []
+
+    files = []
+    for name in os.listdir(COVERS_DIR):
+        lower = name.lower()
+        if lower.endswith(".jpg") or lower.endswith(".jpeg") or lower.endswith(".png"):
+            files.append(os.path.join(COVERS_DIR, name))
+
+    return sorted(files)
+
+
+def get_random_local_cover():
+    covers = get_local_cover_list()
+    if not covers:
+        return ""
+    return random.choice(covers)
+
+
+def get_best_remote_image_url(entry, article_url: str) -> str:
     rss_img = get_image_url_from_rss(entry)
     if is_valid_http_url(rss_img):
         return rss_img
 
-    # 再去原文页面抓图
     page_img = get_image_url_from_page(article_url)
     if is_valid_http_url(page_img):
         return page_img
@@ -273,27 +369,58 @@ def get_best_image_url(entry, article_url: str) -> str:
     return ""
 
 
-def build_caption(title_cn: str, summary_cn: str, tags: list) -> str:
-    header = "【体育快讯】"
-    tag_line = " ".join(tags).strip()
+def guess_extension_from_response(resp, url: str) -> str:
+    content_type = (resp.headers.get("Content-Type") or "").lower()
 
-    parts = [header]
-    if tag_line:
-        parts.append(tag_line)
+    if "jpeg" in content_type or "jpg" in content_type:
+        return ".jpg"
+    if "png" in content_type:
+        return ".png"
+    if "webp" in content_type:
+        return ".webp"
 
-    parts.append("")
-    parts.append(title_cn.strip())
+    parsed = urlparse(url)
+    path = parsed.path.lower()
+    if path.endswith(".jpg") or path.endswith(".jpeg"):
+        return ".jpg"
+    if path.endswith(".png"):
+        return ".png"
+    if path.endswith(".webp"):
+        return ".webp"
 
-    if summary_cn.strip():
-        parts.append("")
-        parts.append(summary_cn.strip())
+    return ".jpg"
 
-    caption = "\n".join(parts).strip()
 
-    if len(caption) > 1000:
-        caption = caption[:1000].rstrip() + "..."
-    return caption
+def download_remote_image(url: str) -> str:
+    if not is_valid_http_url(url):
+        return ""
 
+    try:
+        resp = requests.get(url, headers=REQUEST_HEADERS, timeout=20, stream=True)
+        if resp.status_code != 200:
+            print(f"下载图片失败，状态码: {resp.status_code} -> {url}")
+            return ""
+
+        content_type = (resp.headers.get("Content-Type") or "").lower()
+        if "image/" not in content_type and not any(x in content_type for x in ["jpeg", "jpg", "png", "webp"]):
+            print(f"下载内容不是图片: {content_type} -> {url}")
+            return ""
+
+        ext = guess_extension_from_response(resp, url)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+            for chunk in resp.iter_content(chunk_size=8192):
+                if chunk:
+                    tmp.write(chunk)
+            return tmp.name
+
+    except Exception as e:
+        print(f"下载远程图片异常: {url} -> {e}")
+        return ""
+
+
+# =========================
+# Telegram 发送
+# =========================
 
 def send_telegram_message(text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -310,45 +437,24 @@ def send_telegram_message(text: str):
     return resp
 
 
-def send_telegram_photo(photo_url: str, caption: str):
+def send_telegram_photo_by_file(photo_path: str, caption: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-    resp = requests.post(
-        url,
-        data={
-            "chat_id": CHAT_ID,
-            "photo": photo_url,
-            "caption": caption
-        },
-        timeout=30
-    )
-    print("sendPhoto 结果:", resp.status_code, resp.text)
+    with open(photo_path, "rb") as f:
+        resp = requests.post(
+            url,
+            data={
+                "chat_id": CHAT_ID,
+                "caption": caption
+            },
+            files={"photo": f},
+            timeout=30
+        )
+    print("sendPhoto(file) 结果:", resp.status_code, resp.text)
     return resp
 
 
-def extract_summary(entry) -> str:
-    raw_summary = (
-        getattr(entry, "summary", "")
-        or getattr(entry, "description", "")
-    )
-
-    content_list = getattr(entry, "content", None)
-    if content_list and isinstance(content_list, list):
-        for item in content_list:
-            value = item.get("value", "")
-            if value and len(value) > len(raw_summary):
-                raw_summary = value
-
-    summary_clean = clean_html(raw_summary)
-    summary_clean = re.sub(r"\s+", " ", summary_clean).strip()
-
-    if len(summary_clean) < 40:
-        return ""
-
-    return shorten_text(summary_clean, MAX_SUMMARY_LENGTH)
-
-
 # =========================
-# 核心逻辑
+# 主流程
 # =========================
 
 def process_feed(feed_url: str):
@@ -359,7 +465,7 @@ def process_feed(feed_url: str):
         print("没有抓到内容")
         return
 
-    entries = list(feed.entries[:10])
+    entries = list(feed.entries[:MAX_FEED_ITEMS_PER_CHECK])
     entries.reverse()
 
     first_run = not has_any_sent_items()
@@ -369,6 +475,11 @@ def process_feed(feed_url: str):
         title_en = clean_html(getattr(entry, "title", "").strip())
 
         if not link or not title_en:
+            continue
+
+        if should_skip_title(title_en):
+            print("跳过低价值内容:", title_en)
+            # 不标记 sent，这样以后如果标题规范变化仍有机会被过滤规则重新处理
             continue
 
         if has_sent(link):
@@ -399,22 +510,46 @@ def process_feed(feed_url: str):
         tags = detect_tags(title_en, title_cn, summary_cn)
         caption = build_caption(title_cn, summary_cn, tags)
 
-        image_url = get_best_image_url(entry, link)
-
+        temp_remote_file = ""
         try:
-            if is_valid_http_url(image_url):
-                resp = send_telegram_photo(image_url, caption)
-                if resp.status_code != 200:
-                    print("图片发送失败，改为纯文字")
-                    send_telegram_message(caption)
-            else:
-                send_telegram_message(caption)
+            resp = None
 
-            mark_sent(link)
-            print("已发送:", title_en)
+            # 1) 先尝试远程图：下载后上传
+            remote_img_url = get_best_remote_image_url(entry, link)
+            if remote_img_url:
+                temp_remote_file = download_remote_image(remote_img_url)
+
+            if temp_remote_file and os.path.isfile(temp_remote_file):
+                resp = send_telegram_photo_by_file(temp_remote_file, caption)
+                if resp.status_code != 200:
+                    print("远程图上传失败，尝试公图")
+
+            # 2) 远程图失败，尝试公图
+            if resp is None or resp.status_code != 200:
+                local_cover = get_random_local_cover()
+                if local_cover and os.path.isfile(local_cover):
+                    resp = send_telegram_photo_by_file(local_cover, caption)
+                    if resp.status_code != 200:
+                        print("公图发送失败，改为纯文字")
+                        resp = send_telegram_message(caption)
+                else:
+                    resp = send_telegram_message(caption)
+
+            if resp.status_code == 200:
+                mark_sent(link)
+                print("已发送:", title_en)
+            else:
+                print("发送失败，未记录:", title_en)
 
         except Exception as e:
-            print("发送失败:", e)
+            print("处理失败:", title_en, "->", e)
+
+        finally:
+            if temp_remote_file and os.path.isfile(temp_remote_file):
+                try:
+                    os.remove(temp_remote_file)
+                except Exception:
+                    pass
 
         time.sleep(SEND_DELAY)
 
@@ -427,7 +562,7 @@ def main():
 
     init_db()
 
-    print("体育机器人启动成功（抓原文图版）")
+    print("体育频道机器人启动成功（精简版）")
     print("频道:", CHAT_ID)
 
     while True:
